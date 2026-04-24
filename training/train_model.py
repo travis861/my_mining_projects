@@ -68,6 +68,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=str(REPO_ROOT / "models" / "poker44_xgb_calibrated.joblib"),
     )
+    parser.add_argument(
+        "--search",
+        action="store_true",
+        help="Evaluate a small set of chunk/model configurations and keep the best artifact.",
+    )
+    parser.add_argument(
+        "--search-budget",
+        type=int,
+        default=6,
+        help="Maximum number of candidate configurations to evaluate when --search is enabled.",
+    )
     return parser.parse_args()
 
 
@@ -99,6 +110,213 @@ def model_selection_score(metrics: dict[str, float], objective: str) -> float:
     )
 
 
+def build_search_configs(args: argparse.Namespace) -> list[dict[str, float | int | str]]:
+    base = {
+        "chunk_size": args.chunk_size,
+        "min_chunk_size": args.min_chunk_size,
+        "stride": args.stride,
+        "repeats": args.repeats,
+        "n_estimators": args.n_estimators,
+        "max_depth": args.max_depth,
+        "learning_rate": args.learning_rate,
+        "subsample": args.subsample,
+        "colsample_bytree": args.colsample_bytree,
+        "calibration": args.calibration,
+    }
+    candidates = [
+        base,
+        {
+            **base,
+            "chunk_size": max(64, args.chunk_size - 16),
+            "min_chunk_size": max(32, args.min_chunk_size - 8),
+            "stride": max(24, args.stride - 8),
+            "repeats": max(args.repeats, 4),
+            "learning_rate": 0.03,
+            "n_estimators": max(args.n_estimators, 450),
+            "max_depth": max(args.max_depth, 4),
+        },
+        {
+            **base,
+            "chunk_size": args.chunk_size + 16,
+            "min_chunk_size": args.min_chunk_size + 8,
+            "stride": args.stride + 8,
+            "repeats": max(args.repeats, 4),
+            "learning_rate": 0.04,
+            "n_estimators": max(args.n_estimators, 500),
+            "max_depth": args.max_depth + 1,
+        },
+        {
+            **base,
+            "chunk_size": max(60, args.chunk_size - 20),
+            "min_chunk_size": max(30, args.min_chunk_size - 10),
+            "stride": max(20, args.stride - 12),
+            "repeats": max(args.repeats, 5),
+            "learning_rate": 0.025,
+            "n_estimators": max(args.n_estimators, 650),
+            "max_depth": max(args.max_depth, 6),
+            "subsample": min(1.0, max(args.subsample, 0.95)),
+            "colsample_bytree": min(1.0, max(args.colsample_bytree, 0.95)),
+        },
+        {
+            **base,
+            "chunk_size": args.chunk_size,
+            "min_chunk_size": args.min_chunk_size,
+            "stride": max(20, args.stride // 2),
+            "repeats": max(args.repeats, 6),
+            "learning_rate": 0.035,
+            "n_estimators": max(args.n_estimators, 700),
+            "max_depth": max(args.max_depth, 6),
+        },
+        {
+            **base,
+            "chunk_size": args.chunk_size + 24,
+            "min_chunk_size": args.min_chunk_size + 12,
+            "stride": args.stride,
+            "repeats": max(args.repeats, 4),
+            "learning_rate": 0.02,
+            "n_estimators": max(args.n_estimators, 800),
+            "max_depth": max(args.max_depth, 7),
+            "calibration": "sigmoid" if args.calibration == "auto" else args.calibration,
+        },
+    ]
+    budget = max(1, int(args.search_budget))
+    return candidates[:budget]
+
+
+def _fit_single_candidate(
+    *,
+    args: argparse.Namespace,
+    candidate_config: dict[str, float | int | str],
+    human_hands: list[dict],
+    bot_hands: list[dict],
+    benchmark_train_rows: list[dict[str, float]],
+    benchmark_validation_rows: list[dict[str, float]],
+) -> tuple[object, list[str], dict[str, float], dict[str, float | int | str], str]:
+    raw_rows = build_training_dataframe(
+        human_hands=human_hands,
+        bot_hands=bot_hands,
+        chunk_size=int(candidate_config["chunk_size"]),
+        min_chunk_size=int(candidate_config["min_chunk_size"]),
+        stride=int(candidate_config["stride"]),
+        repeats=int(candidate_config["repeats"]),
+        seed=args.seed,
+    )
+    rows = list(raw_rows) + list(benchmark_train_rows)
+    if not rows:
+        raise RuntimeError("Training dataframe is empty. Verify your human/bot hand sources.")
+
+    feature_names = sorted(key for key in rows[0].keys() if key != "label")
+    if benchmark_validation_rows:
+        X_train = [[float(row.get(name, 0.0)) for name in feature_names] for row in rows]
+        y_train = [int(row["label"]) for row in rows]
+        X_test = [[float(row.get(name, 0.0)) for name in feature_names] for row in benchmark_validation_rows]
+        y_test = [int(row["label"]) for row in benchmark_validation_rows]
+    else:
+        X = [[float(row.get(name, 0.0)) for name in feature_names] for row in rows]
+        y = [int(row["label"]) for row in rows]
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=args.test_size,
+            random_state=args.seed,
+            stratify=y,
+        )
+
+    if XGBClassifier is not None:
+        booster_model = XGBClassifier(
+            n_estimators=int(candidate_config["n_estimators"]),
+            max_depth=int(candidate_config["max_depth"]),
+            learning_rate=float(candidate_config["learning_rate"]),
+            subsample=float(candidate_config["subsample"]),
+            colsample_bytree=float(candidate_config["colsample_bytree"]),
+            eval_metric="logloss",
+            random_state=args.seed,
+            n_jobs=1,
+        )
+        forest_model = ExtraTreesClassifier(
+            n_estimators=max(200, int(candidate_config["n_estimators"])),
+            max_depth=int(candidate_config["max_depth"]) + 2,
+            min_samples_leaf=2,
+            class_weight="balanced",
+            random_state=args.seed,
+            n_jobs=1,
+        )
+        base_model = VotingClassifier(
+            estimators=[("xgb", booster_model), ("et", forest_model)],
+            voting="soft",
+            weights=[2, 1],
+        )
+        framework_name = "xgboost+extra-trees+sklearn-calibration"
+    else:
+        booster_model = HistGradientBoostingClassifier(
+            learning_rate=float(candidate_config["learning_rate"]),
+            max_depth=int(candidate_config["max_depth"]),
+            max_iter=int(candidate_config["n_estimators"]),
+            random_state=args.seed,
+        )
+        forest_model = ExtraTreesClassifier(
+            n_estimators=max(300, int(candidate_config["n_estimators"])),
+            max_depth=int(candidate_config["max_depth"]) + 2,
+            min_samples_leaf=2,
+            class_weight="balanced",
+            random_state=args.seed,
+            n_jobs=1,
+        )
+        base_model = VotingClassifier(
+            estimators=[("hgb", booster_model), ("et", forest_model)],
+            voting="soft",
+            weights=[2, 1],
+        )
+        framework_name = "sklearn-hist-gradient-boosting+extra-trees+calibration"
+
+    requested_calibration = choose_calibration(str(candidate_config["calibration"]), len(X_train))
+    calibration_mode = str(candidate_config["calibration"])
+    candidate_calibrations = (
+        [requested_calibration] if calibration_mode != "auto" else ["sigmoid", "isotonic", None]
+    )
+
+    best_model = None
+    best_metrics = None
+    best_calibration = None
+    best_selection_score = float("-inf")
+
+    for calibration_method in candidate_calibrations:
+        candidate_model = base_model
+        if calibration_method is not None:
+            candidate_model = CalibratedClassifierCV(base_model, method=calibration_method, cv=3)
+        candidate_model.fit(X_train, y_train)
+        if hasattr(candidate_model, "predict_proba"):
+            candidate_probs = candidate_model.predict_proba(X_test)[:, 1]
+        else:
+            candidate_probs = candidate_model.predict(X_test)
+        candidate_metrics = evaluate_predictions(y_true=y_test, y_prob=candidate_probs)
+        candidate_score = model_selection_score(candidate_metrics, args.selection_objective)
+        print(
+            "candidate",
+            f"chunk_size={candidate_config['chunk_size']}",
+            f"stride={candidate_config['stride']}",
+            f"repeats={candidate_config['repeats']}",
+            f"n_estimators={candidate_config['n_estimators']}",
+            f"max_depth={candidate_config['max_depth']}",
+            f"learning_rate={candidate_config['learning_rate']}",
+            f"calibration={calibration_method or 'none'}",
+            f"selection_score={candidate_score:.6f}",
+            format_metrics(candidate_metrics),
+        )
+        if candidate_score > best_selection_score:
+            best_selection_score = candidate_score
+            best_model = candidate_model
+            best_metrics = candidate_metrics
+            best_calibration = calibration_method
+
+    result_config = dict(candidate_config)
+    result_config["calibration"] = best_calibration or "none"
+    result_config["raw_rows"] = float(len(raw_rows))
+    result_config["train_rows"] = float(len(X_train))
+    result_config["test_rows"] = float(len(X_test))
+    return best_model, feature_names, dict(best_metrics or {}), result_config, framework_name
+
+
 def train_model(args: argparse.Namespace) -> tuple[object, list[str], dict[str, float]]:
     if joblib is None:
         raise RuntimeError(
@@ -123,159 +341,77 @@ def train_model(args: argparse.Namespace) -> tuple[object, list[str], dict[str, 
     except FileNotFoundError:
         benchmark_path = None
 
-    raw_rows = build_training_dataframe(
-        human_hands=human_hands,
-        bot_hands=bot_hands,
-        chunk_size=args.chunk_size,
-        min_chunk_size=args.min_chunk_size,
-        stride=args.stride,
-        repeats=args.repeats,
-        seed=args.seed,
-    )
     benchmark_train_rows: list[dict[str, float]] = []
     benchmark_validation_rows: list[dict[str, float]] = []
     if benchmark_path is not None:
         benchmark_train_rows = load_public_benchmark_rows(benchmark_path, split_filter="train")
         benchmark_validation_rows = load_public_benchmark_rows(benchmark_path, split_filter="validation")
 
-    rows = list(raw_rows) + list(benchmark_train_rows)
-    if not rows:
-        raise RuntimeError("Training dataframe is empty. Verify your human/bot hand sources.")
-
-    feature_names = sorted(key for key in rows[0].keys() if key != "label")
-    if benchmark_validation_rows:
-        X_train = [[float(row.get(name, 0.0)) for name in feature_names] for row in rows]
-        y_train = [int(row["label"]) for row in rows]
-        X_test = [[float(row.get(name, 0.0)) for name in feature_names] for row in benchmark_validation_rows]
-        y_test = [int(row["label"]) for row in benchmark_validation_rows]
-    else:
-        X = [[float(row.get(name, 0.0)) for name in feature_names] for row in rows]
-        y = [int(row["label"]) for row in rows]
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
-            test_size=args.test_size,
-            random_state=args.seed,
-            stratify=y,
-        )
-
-    if XGBClassifier is not None:
-        booster_model = XGBClassifier(
-            n_estimators=args.n_estimators,
-            max_depth=args.max_depth,
-            learning_rate=args.learning_rate,
-            subsample=args.subsample,
-            colsample_bytree=args.colsample_bytree,
-            eval_metric="logloss",
-            random_state=args.seed,
-            n_jobs=1,
-        )
-        forest_model = ExtraTreesClassifier(
-            n_estimators=max(200, args.n_estimators),
-            max_depth=args.max_depth + 2,
-            min_samples_leaf=2,
-            class_weight="balanced",
-            random_state=args.seed,
-            n_jobs=1,
-        )
-        base_model = VotingClassifier(
-            estimators=[("xgb", booster_model), ("et", forest_model)],
-            voting="soft",
-            weights=[2, 1],
-        )
-        framework_name = "xgboost+extra-trees+sklearn-calibration"
-    else:
-        booster_model = HistGradientBoostingClassifier(
-            learning_rate=args.learning_rate,
-            max_depth=args.max_depth,
-            max_iter=args.n_estimators,
-            random_state=args.seed,
-        )
-        forest_model = ExtraTreesClassifier(
-            n_estimators=max(300, args.n_estimators),
-            max_depth=args.max_depth + 2,
-            min_samples_leaf=2,
-            class_weight="balanced",
-            random_state=args.seed,
-            n_jobs=1,
-        )
-        base_model = VotingClassifier(
-            estimators=[("hgb", booster_model), ("et", forest_model)],
-            voting="soft",
-            weights=[2, 1],
-        )
-        framework_name = "sklearn-hist-gradient-boosting+extra-trees+calibration"
-
-    requested_calibration = choose_calibration(args.calibration, len(X_train))
-    candidate_calibrations = (
-        [requested_calibration]
-        if args.calibration != "auto"
-        else ["sigmoid", "isotonic", None]
-    )
+    search_configs = build_search_configs(args) if args.search else [{
+        "chunk_size": args.chunk_size,
+        "min_chunk_size": args.min_chunk_size,
+        "stride": args.stride,
+        "repeats": args.repeats,
+        "n_estimators": args.n_estimators,
+        "max_depth": args.max_depth,
+        "learning_rate": args.learning_rate,
+        "subsample": args.subsample,
+        "colsample_bytree": args.colsample_bytree,
+        "calibration": args.calibration,
+    }]
 
     best_model = None
     best_metrics = None
-    best_probs = None
-    best_calibration = None
+    best_feature_names = None
+    best_config = None
+    best_framework_name = ""
     best_selection_score = float("-inf")
-
-    for calibration_method in candidate_calibrations:
-        candidate_model = base_model
-        if calibration_method is not None:
-            candidate_model = CalibratedClassifierCV(base_model, method=calibration_method, cv=3)
-
-        candidate_model.fit(X_train, y_train)
-
-        if hasattr(candidate_model, "predict_proba"):
-            candidate_probs = candidate_model.predict_proba(X_test)[:, 1]
-        else:
-            candidate_probs = candidate_model.predict(X_test)
-
-        candidate_metrics = evaluate_predictions(
-            y_true=y_test,
-            y_prob=candidate_probs,
+    for search_index, candidate_config in enumerate(search_configs, start=1):
+        print(f"search_candidate={search_index}/{len(search_configs)} config={candidate_config}")
+        model, feature_names, metrics, result_config, framework_name = _fit_single_candidate(
+            args=args,
+            candidate_config=candidate_config,
+            human_hands=human_hands,
+            bot_hands=bot_hands,
+            benchmark_train_rows=benchmark_train_rows,
+            benchmark_validation_rows=benchmark_validation_rows,
         )
-        candidate_score = model_selection_score(candidate_metrics, args.selection_objective)
-
-        print(
-            "candidate",
-            f"calibration={calibration_method or 'none'}",
-            f"selection_score={candidate_score:.6f}",
-            format_metrics(candidate_metrics),
-        )
-
+        candidate_score = model_selection_score(metrics, args.selection_objective)
         if candidate_score > best_selection_score:
             best_selection_score = candidate_score
-            best_model = candidate_model
-            best_metrics = candidate_metrics
-            best_probs = candidate_probs
-            best_calibration = calibration_method
+            best_model = model
+            best_metrics = metrics
+            best_feature_names = feature_names
+            best_config = result_config
+            best_framework_name = framework_name
 
     model = best_model
-    probs = best_probs
-    calibration_method = best_calibration
+    feature_names = list(best_feature_names or [])
+    final_config = dict(best_config or {})
 
     artifact_meta = {
-        "chunk_size": float(args.chunk_size),
-        "min_chunk_size": float(args.min_chunk_size),
-        "stride": float(args.stride),
-        "repeats": float(args.repeats),
-        "n_estimators": float(args.n_estimators),
-        "max_depth": float(args.max_depth),
-        "learning_rate": float(args.learning_rate),
-        "subsample": float(args.subsample),
-        "colsample_bytree": float(args.colsample_bytree),
-        "calibration": calibration_method or "none",
+        "chunk_size": float(final_config.get("chunk_size", args.chunk_size)),
+        "min_chunk_size": float(final_config.get("min_chunk_size", args.min_chunk_size)),
+        "stride": float(final_config.get("stride", args.stride)),
+        "repeats": float(final_config.get("repeats", args.repeats)),
+        "n_estimators": float(final_config.get("n_estimators", args.n_estimators)),
+        "max_depth": float(final_config.get("max_depth", args.max_depth)),
+        "learning_rate": float(final_config.get("learning_rate", args.learning_rate)),
+        "subsample": float(final_config.get("subsample", args.subsample)),
+        "colsample_bytree": float(final_config.get("colsample_bytree", args.colsample_bytree)),
+        "calibration": str(final_config.get("calibration", args.calibration)),
         "selection_objective": args.selection_objective,
-        "framework": framework_name,
+        "framework": best_framework_name,
         "human_path": str(human_path),
         "bot_path": str(bot_path),
         "benchmark_path": str(benchmark_path) if benchmark_path is not None else "",
         "benchmark_train_rows": float(len(benchmark_train_rows)),
         "benchmark_validation_rows": float(len(benchmark_validation_rows)),
-        "raw_rows": float(len(raw_rows)),
-        "train_rows": float(len(X_train)),
-        "test_rows": float(len(X_test)),
+        "raw_rows": float(final_config.get("raw_rows", 0.0)),
+        "train_rows": float(final_config.get("train_rows", 0.0)),
+        "test_rows": float(final_config.get("test_rows", 0.0)),
+        "search_enabled": 1.0 if args.search else 0.0,
+        "search_candidates": float(len(search_configs)),
     }
 
     output_path = Path(args.output)

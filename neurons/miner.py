@@ -25,7 +25,12 @@ class Miner(BaseMinerNeuron):
         self.query_log_preview = os.getenv("POKER44_LOG_QUERY_PREVIEW", "0") == "1"
 
         repo_root = Path(__file__).resolve().parents[1]
-        model_path = repo_root / "models" / "poker44_xgb_calibrated.joblib"
+        model_path = Path(
+            os.getenv(
+                "POKER44_MODEL_PATH",
+                str(repo_root / "models" / "poker44_xgb_calibrated.joblib"),
+            )
+        )
         self.predictor = Poker44Model(str(model_path))
 
         self.model_manifest = build_local_model_manifest(
