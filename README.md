@@ -126,6 +126,7 @@ git clone https://github.com/Poker44/Poker44-subnet
 cd Poker44-subnet
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 pip install -e .
 ```
 
@@ -143,6 +144,34 @@ Validated starting profile for production-like operation:
 - `POKER44_REWARD_WINDOW=40`
 - `POKER44_POLL_INTERVAL_SECONDS=300`
 - `--neuron.timeout 60`
+
+Production-facing miner run flow:
+
+```bash
+WALLET_NAME=my_cold \
+HOTKEY=my_poker44_hotkey \
+AXON_PORT=8091 \
+ALLOWED_VALIDATOR_HOTKEYS="validator_hotkey_1 validator_hotkey_2" \
+./scripts/miner/run/run_miner.sh
+```
+
+If `ALLOWED_VALIDATOR_HOTKEYS` is not set, the miner falls back to
+`--blacklist.force_validator_permit`. If public RPC reliability is poor, set
+`CHAIN_ENDPOINT` to a more stable websocket endpoint or local node.
+
+---
+
+## Miner Priorities for Reward
+
+Validator logic rewards miners that consistently produce useful bot-risk scores under the
+production query loop. In practice, miner operators should prioritize:
+
+- high-quality, well-calibrated predictions on mixed human/bot chunks;
+- a complete `model_manifest` with transparent training-data disclosures;
+- low-latency, always-online axon availability;
+- correct handling of every requested chunk in a cycle;
+- compliant behavior that avoids anti-leakage and suspicious-output triggers;
+- stable uptime so the miner is available when validator fanout samples the network.
 
 ---
 

@@ -1,9 +1,5 @@
-"""Reference Poker44 miner with simple chunk-level behavioral heuristics."""
-
-# from __future__ import annotations
-
+import os
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Tuple
 
@@ -16,58 +12,55 @@ from poker44.utils.model_manifest import (
     manifest_digest,
 )
 from poker44.validator.synapse import DetectionSynapse
+from poker44_ml.inference import Poker44Model
 
 
 class Miner(BaseMinerNeuron):
-    """
-    Reference heuristic miner.
-
-    It aggregates simple behavior signals over each chunk and returns a bot-risk
-    score per chunk. The goal is not SOTA accuracy, but a deterministic and
-    explainable baseline that is meaningfully better than random.
-    """
-
     def __init__(self, config=None):
-        super(Miner, self).__init__(config=config)
-        bt.logging.info("🤖 Heuristic Poker44 Miner started")
+        super().__init__(config=config)
+        bt.logging.info("Poker44 ML miner started")
+        self.max_hands_per_chunk_eval = max(
+            0, int(os.getenv("POKER44_MAX_HANDS_PER_CHUNK_EVAL", "120"))
+        )
+        self.query_log_preview = os.getenv("POKER44_LOG_QUERY_PREVIEW", "0") == "1"
+
         repo_root = Path(__file__).resolve().parents[1]
+        model_path = repo_root / "models" / "poker44_xgb_calibrated.joblib"
+        self.predictor = Poker44Model(str(model_path))
+
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
             implementation_files=[Path(__file__).resolve()],
             defaults={
-                "model_name": "poker44-reference-heuristic",
+                "model_name": "poker44-xgb-calibrated",
                 "model_version": "1",
-                "framework": "python-heuristic",
+                "framework": self.predictor.metadata.get("framework", "xgboost+sklearn"),
                 "license": "MIT",
                 "repo_url": "https://github.com/Poker44/Poker44-subnet",
-                "notes": "Reference heuristic miner shipped with the Poker44 subnet.",
+                "notes": "Chunk-level tabular model with calibrated probabilities.",
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (
-                    "Reference heuristic miner. No training step. Uses only runtime chunk features."
+                    "Trained on public human corpus plus offline-generated bot hands."
                 ),
-                "training_data_sources": ["none"],
+                "training_data_sources": ["public_human_corpus", "generated_bot_hands"],
                 "private_data_attestation": (
-                    "This reference miner does not train on validator-private human data."
+                    "This miner does not train on validator-private human data."
                 ),
             },
         )
         self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
         self.manifest_digest = manifest_digest(self.model_manifest)
-        self._log_manifest_startup(repo_root)
-        
-        # # Attach handlers after initialization
-        # self.axon.attach(
-        #     forward_fn = self.forward,
-        #     blacklist_fn = self.blacklist,
-        #     priority_fn = self.priority,
-        # )
-        # bt.logging.info("Attaching forward function to miner axon.")
-        
-        bt.logging.info(f"Axon created: {self.axon}")
+        self._log_manifest_startup(repo_root=repo_root, model_path=model_path)
 
-    def _log_manifest_startup(self, repo_root: Path) -> None:
+    def _log_manifest_startup(self, repo_root: Path, model_path: Path) -> None:
         bt.logging.info("Open-sourced miner manifest standard active for this miner.")
+        bt.logging.info(f"Loaded model from {model_path}")
+        bt.logging.info(
+            f"Model metadata: feature_count={len(self.predictor.feature_names)} "
+            f"calibration={self.predictor.metadata.get('calibration', 'unknown')} "
+            f"framework={self.predictor.metadata.get('framework', 'unknown')}"
+        )
         bt.logging.info(
             f"Miner transparency status: {self.manifest_compliance['status']} "
             f"(missing_fields={self.manifest_compliance['missing_fields']})"
@@ -97,82 +90,103 @@ class Miner(BaseMinerNeuron):
             "Purpose: train, validate and refine miner models against the public benchmark "
             "while Poker44 moves toward more dynamic evaluation."
         )
-
-    async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
-        """Assign one deterministic bot-risk score per chunk."""
-        chunks = synapse.chunks or []
-        scores = [self.score_chunk(chunk) for chunk in chunks]
-        synapse.risk_scores = scores
-        synapse.predictions = [s >= 0.5 for s in scores]
-        synapse.model_manifest = dict(self.model_manifest)
-        bt.logging.info(f"Miner Predctions: {synapse.predictions}")
-        bt.logging.info(f"Scored {len(chunks)} chunks with heuristic risks.")
-        return synapse
-
-    @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(1.0, value))
-
-    @classmethod
-    def _score_hand(cls, hand: dict) -> float:
-        actions = hand.get("actions") or []
-        players = hand.get("players") or []
-        streets = hand.get("streets") or []
-        outcome = hand.get("outcome") or {}
-
-        action_counts = Counter(action.get("action_type") for action in actions)
-        meaningful_actions = max(
-            1,
-            sum(
-                action_counts.get(kind, 0)
-                for kind in ("call", "check", "bet", "raise", "fold")
-            ),
+        bt.logging.info(
+            f"Fast inference settings | max_hands_per_chunk_eval={self.max_hands_per_chunk_eval} "
+            f"query_log_preview={self.query_log_preview}"
         )
 
-        call_ratio = action_counts.get("call", 0) / meaningful_actions
-        check_ratio = action_counts.get("check", 0) / meaningful_actions
-        fold_ratio = action_counts.get("fold", 0) / meaningful_actions
-        raise_ratio = action_counts.get("raise", 0) / meaningful_actions
-        street_depth = len(streets) / 3.0
-        showdown_flag = 1.0 if outcome.get("showdown") else 0.0
+    @staticmethod
+    def _clamp_score(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
 
-        player_count_signal = 0.0
-        if players:
-            player_count_signal = (6 - min(len(players), 6)) / 4.0
+    def _compress_chunk(self, chunk: list[dict]) -> list[dict]:
+        if self.max_hands_per_chunk_eval <= 0 or len(chunk) <= self.max_hands_per_chunk_eval:
+            return chunk
+        if self.max_hands_per_chunk_eval == 1:
+            return [chunk[len(chunk) // 2]]
 
-        score = 0.0
-        score += 0.32 * street_depth
-        score += 0.22 * showdown_flag
-        score += 0.18 * cls._clamp01(call_ratio / 0.35)
-        score += 0.12 * cls._clamp01(check_ratio / 0.30)
-        score += 0.08 * cls._clamp01(player_count_signal)
-        score -= 0.18 * cls._clamp01(fold_ratio / 0.55)
-        score -= 0.10 * cls._clamp01(raise_ratio / 0.20)
+        last_index = len(chunk) - 1
+        slots = self.max_hands_per_chunk_eval - 1
+        indices = {
+            min(last_index, round(i * last_index / slots))
+            for i in range(self.max_hands_per_chunk_eval)
+        }
+        return [chunk[index] for index in sorted(indices)]
 
-        return cls._clamp01(score)
+    async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
+        chunks = list(synapse.chunks or [])
+        caller = getattr(getattr(synapse, "dendrite", None), "hotkey", "unknown")
+        chunk_sizes = [len(chunk or []) for chunk in chunks]
+        eval_chunks = [self._compress_chunk(list(chunk or [])) for chunk in chunks]
+        eval_chunk_sizes = [len(chunk) for chunk in eval_chunks]
+        bt.logging.info(
+            f"Received validator query | caller={caller} "
+            f"chunk_count={len(chunks)} "
+            f"chunk_size_range={[min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0]} "
+            f"eval_chunk_size_range={[min(eval_chunk_sizes), max(eval_chunk_sizes)] if eval_chunk_sizes else [0, 0]}"
+        )
+        started = time.perf_counter()
+        try:
+            raw_scores = self.predictor.predict_chunk_scores(eval_chunks)
+        except Exception as err:
+            bt.logging.error(f"Predictor failure | caller={caller} error={err}")
+            raw_scores = [0.5] * len(chunks)
 
-    @classmethod
-    def score_chunk(cls, chunk: list[dict]) -> float:
-        if not chunk:
-            return 0.5
+        scores = [round(self._clamp_score(score), 6) for score in raw_scores[: len(chunks)]]
+        if len(scores) < len(chunks):
+            deficit = len(chunks) - len(scores)
+            bt.logging.warning(
+                f"Score count mismatch | caller={caller} expected={len(chunks)} got={len(scores)} "
+                f"padding_with=0.5 count={deficit}"
+            )
+            scores.extend([0.5] * deficit)
+        elif len(raw_scores) > len(chunks):
+            bt.logging.warning(
+                f"Score count mismatch | caller={caller} expected={len(chunks)} got={len(raw_scores)} "
+                "truncating extras"
+            )
 
-        hand_scores = [cls._score_hand(hand) for hand in chunk]
-        avg_score = sum(hand_scores) / len(hand_scores)
-
-        return round(cls._clamp01(avg_score), 6)
+        synapse.risk_scores = scores
+        synapse.predictions = [score >= 0.5 for score in scores]
+        synapse.model_manifest = dict(self.model_manifest)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        per_chunk_ms = elapsed_ms / max(len(chunks), 1)
+        message = (
+            f"Scored {len(chunks)} chunks in {elapsed_ms:.2f} ms "
+            f"({per_chunk_ms:.2f} ms/chunk) "
+            f"score_range={[min(scores), max(scores)] if scores else [0.0, 0.0]}"
+        )
+        if self.query_log_preview:
+            message += (
+                f" score_preview={scores[:5]} "
+                f"prediction_preview={synapse.predictions[:5]}"
+            )
+        bt.logging.info(message)
+        bt.logging.success(
+            f"Validator response sent successfully | caller={caller} "
+            f"chunk_count={len(chunks)} "
+            f"response_count={len(scores)} "
+            f"elapsed_ms={elapsed_ms:.2f}"
+        )
+        return synapse
 
     async def blacklist(self, synapse: DetectionSynapse) -> Tuple[bool, str]:
-        """Determine whether to blacklist incoming requests."""
-        return self.common_blacklist(synapse)
+        blocked, reason = self.common_blacklist(synapse)
+        caller = getattr(getattr(synapse, "dendrite", None), "hotkey", "unknown")
+        if blocked:
+            bt.logging.warning(f"Blacklisted request | caller={caller} reason={reason}")
+        return blocked, reason
 
     async def priority(self, synapse: DetectionSynapse) -> float:
-        """Assign priority based on caller's stake."""
-        return self.caller_priority(synapse)
+        priority = self.caller_priority(synapse)
+        return priority
 
 
 if __name__ == "__main__":
     with Miner() as miner:
-        bt.logging.info("Random miner running...")
+        bt.logging.info("ML miner running...")
         while True:
-            bt.logging.info(f"Miner UID: {miner.uid} | Incentive: {miner.metagraph.I[miner.uid]}")
+            bt.logging.info(
+                f"Miner UID: {miner.uid} | Incentive: {miner.metagraph.I[miner.uid]}"
+            )
             time.sleep(5 * 60)

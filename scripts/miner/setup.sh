@@ -134,9 +134,17 @@ show_completion_info() {
   echo -e "\e[33m[INFO]\e[0m To activate: source miner_env/bin/activate"
   echo
   echo -e "\e[34m[NEXT STEPS]\e[0m"
-  echo "1. Review scripts/miner/run/run_miner.sh and set wallet, hotkey, axon port, and allowlisted validators."
+  echo "1. Register a coldkey/hotkey for subnet 126 using bittensor-cli if you have not already."
+  echo "2. Train or place a valid model artifact at models/poker44_xgb_calibrated.joblib."
+  echo "3. Set environment variables before starting the miner:"
+  echo "   export WALLET_NAME=my_cold"
+  echo "   export HOTKEY=my_poker44_hotkey"
+  echo "   export AXON_PORT=8091"
+  echo "   export ALLOWED_VALIDATOR_HOTKEYS=\"validator_hotkey_1 validator_hotkey_2\""
+  echo "4. Start the miner:"
   echo "   source miner_env/bin/activate"
   echo "   ./scripts/miner/run/run_miner.sh"
+  echo "5. Optional: override public RPC with CHAIN_ENDPOINT if DNS or websocket reliability is poor."
 }
 
 main() {

@@ -49,6 +49,10 @@ Script path: `scripts/miner/run/run_miner.sh`
 
 ```bash
 chmod +x ./scripts/miner/run/run_miner.sh
+WALLET_NAME=my_cold \
+HOTKEY=my_poker44_hotkey \
+AXON_PORT=8091 \
+ALLOWED_VALIDATOR_HOTKEYS="validator_hotkey_1 validator_hotkey_2" \
 ./scripts/miner/run/run_miner.sh
 ```
 
@@ -60,6 +64,8 @@ Before using the script, set at least:
 - `ALLOWED_VALIDATOR_HOTKEYS` for the recommended Swarm-like allowlist mode
 
 If `ALLOWED_VALIDATOR_HOTKEYS` is left empty, the script falls back to `--blacklist.force_validator_permit`.
+If DNS or websocket reliability is poor, you can also set `CHAIN_ENDPOINT` to override the
+default public RPC endpoint while keeping `NETWORK=finney`.
 
 The script is environment-driven. Example:
 
@@ -244,3 +250,29 @@ See also:
 - Axon served and visible on-chain.
 - Validator queries are accepted.
 - Miner returns non-empty `risk_scores` with correct chunk count.
+
+---
+
+## Reward Optimization
+
+Validator scoring favors miners that are robust in the live forward cycle, not just miners
+that respond once. Practical priorities:
+
+1. Optimize your miner model.
+   Train for accurate chunk-level bot-risk prediction, minimize false positives, and calibrate
+   probabilities so returned `risk_scores` are useful to validators over time.
+2. Be transparent with your model manifest.
+   Fill out the recommended `model_manifest` fields so the validator can classify your miner as
+   `transparent` rather than `opaque`.
+3. Maximize availability and speed.
+   Validators score miners in cycles with a timeout budget. Keep your axon online and your
+   responses comfortably below the timeout.
+4. Handle every chunk correctly.
+   Validators query chunked windows. Returning incomplete or malformed `risk_scores` can zero
+   out otherwise good cycles.
+5. Avoid anti-leakage triggers.
+   Do not reuse stale outputs or produce suspiciously manipulated results. Keep the miner
+   aligned with the manifest, sanitized payload shape, and compliance expectations.
+6. Maintain steady uptime.
+   Validator fanout samples only part of the miner set each cycle. Stable uptime increases the
+   number of cycles in which your miner can be queried and rewarded.
