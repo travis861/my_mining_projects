@@ -102,7 +102,15 @@ class Miner(BaseMinerNeuron):
 
     @staticmethod
     def _clamp_score(value: float) -> float:
-        return max(0.0, min(1.0, float(value)))
+        clamped = max(0.0, min(1.0, float(value)))
+        # Log when scores are outside valid range (indicates model miscalibration or NaN/Inf)
+        if value != clamped:
+            if value < 0.0 or value > 1.0:
+                bt.logging.debug(
+                    f"Score clamped from {value} to {clamped} "
+                    f"(indicates model returned out-of-bounds value)"
+                )
+        return clamped
 
     def _compress_chunk(self, chunk: list[dict]) -> list[dict]:
         if self.max_hands_per_chunk_eval <= 0 or len(chunk) <= self.max_hands_per_chunk_eval:
@@ -140,15 +148,19 @@ class Miner(BaseMinerNeuron):
         scores = [round(self._clamp_score(score), 6) for score in raw_scores[: len(chunks)]]
         if len(scores) < len(chunks):
             deficit = len(chunks) - len(scores)
-            bt.logging.warning(
-                f"Score count mismatch | caller={caller} expected={len(chunks)} got={len(scores)} "
-                f"padding_with=0.5 count={deficit}"
+            bt.logging.error(
+                f"CRITICAL: Score count mismatch | caller={caller} expected={len(chunks)} got={len(scores)} "
+                f"deficit={deficit}. Model returned fewer scores than chunks. "
+                f"Padding with 0.5 (neutral) scores degrades detection accuracy. "
+                f"This indicates a model failure - check inference pipeline."
             )
             scores.extend([0.5] * deficit)
         elif len(raw_scores) > len(chunks):
-            bt.logging.warning(
-                f"Score count mismatch | caller={caller} expected={len(chunks)} got={len(raw_scores)} "
-                "truncating extras"
+            bt.logging.error(
+                f"CRITICAL: Score count mismatch | caller={caller} expected={len(chunks)} got={len(raw_scores)} "
+                f"Model returned more scores than chunks (excess={len(raw_scores) - len(chunks)}). "
+                f"Truncating excess scores may lose information. "
+                f"Check inference pipeline for correctness."
             )
 
         synapse.risk_scores = scores

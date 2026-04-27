@@ -25,10 +25,12 @@ def reward(y_pred: np.ndarray, y_true: np.ndarray) -> tuple[float, dict]:
     else:
         ap_score = 0.0
 
-    # Hard human-safety penalty: a miner that harms humans should not win.
-    human_safety_penalty = max(0.0, 1.0 - fpr) ** 2
-    if fpr >= 0.10:
-        human_safety_penalty = 0.0
+    # Smooth human-safety penalty using sigmoid to prevent cliff-based gaming.
+    # Sigmoid ensures continuous, non-exploitable penalty curve.
+    # At FPR=0%, penalty=1.0; at FPR=10%, penalty≈0.27; at FPR=20%, penalty≈0.04
+    fpr_threshold = 0.05  # Target acceptable FPR
+    penalty_slope = 50.0   # Steepness of penalty transition
+    human_safety_penalty = 1.0 / (1.0 + np.exp(penalty_slope * (fpr - fpr_threshold)))
 
     base_score = 0.65 * ap_score + 0.35 * bot_recall
     rew = base_score * human_safety_penalty

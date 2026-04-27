@@ -221,12 +221,32 @@ class HandHistory:
 
     @property
     def label(self) -> bool:
+        """
+        Return ground-truth label for this hand.
+        
+        Priority order:
+        1. Explicit label_flag if set
+        2. Check if MAJORITY of participants are bots (requires ≥50% bots)
+        3. Default to False (human) if ambiguous
+        
+        Note: This avoids misclassifying mixed tables as "bot hands" when only
+        a minority of players are bots.
+        """
         if self.label_flag is not None:
             return bool(self.label_flag)
-        # Fallback: infer from participant bot flags if provided.
-        for player in self.participants:
-            if player.is_bot is not None:
-                return bool(player.is_bot)
+        
+        # Check bot participation rate
+        bot_count = sum(1 for p in self.participants if p.is_bot is True)
+        total_participants = len(self.participants)
+        
+        if total_participants == 0:
+            return False
+        
+        bot_ratio = bot_count / total_participants
+        # Only classify as "bot hand" if MAJORITY are bots (>50%)
+        if bot_ratio > 0.5:
+            return True
+        
         return False
 
     @classmethod

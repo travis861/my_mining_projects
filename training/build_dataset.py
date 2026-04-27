@@ -83,7 +83,9 @@ def build_chunks(
     repeats: int = 1,
 ) -> list[dict[str, float]]:
     minimum = min_chunk_size if min_chunk_size is not None else max(20, chunk_size // 2)
-    stride = stride if stride is not None else max(8, chunk_size // 2)
+    # Use non-overlapping chunks by default (stride=chunk_size) to avoid data leakage.
+    # Overlapping chunks (stride < chunk_size) inflate test accuracy but reduce generalization.
+    stride = stride if stride is not None else chunk_size
     rows: list[dict[str, float]] = []
     seen_signatures: set[tuple[int, int, int]] = set()
     for repeat in range(max(1, repeats)):

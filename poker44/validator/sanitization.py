@@ -32,18 +32,23 @@ _ALLOWED_ACTION_TYPES = {
 }
 
 
-def _round_bounded(value: float, *, lower: float = 0.0, upper: float) -> float:
-    return round(max(lower, min(upper, float(value))), 2)
+def _round_bounded(value: float, *, lower: float = 0.0, upper: float) -> tuple[float, bool]:
+    """Clamp value and return (clamped_value, was_clipped)."""
+    clamped = round(max(lower, min(upper, float(value))), 2)
+    was_clipped = value > upper
+    return clamped, was_clipped
 
 
-def _to_bb_units(value: Any, bb: float, *, upper: float) -> float:
+def _to_bb_units(value: Any, bb: float, *, upper: float) -> tuple[float, bool]:
+    """Convert to BB units, return (value_in_bb, was_clipped)."""
     try:
         numeric = float(value or 0.0)
     except (TypeError, ValueError):
         numeric = 0.0
     if bb <= 0:
-        return 0.0
-    return _round_bounded(numeric / bb, upper=upper)
+        return 0.0, False
+    normalized = numeric / bb
+    return _round_bounded(normalized, upper=upper)
 
 
 def _from_bb_units(bb_value: float, *, sanitized_bb: float = _SANITIZED_BB) -> float:
@@ -112,11 +117,12 @@ def sanitize_hand_for_miner(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
         seat_i = _sanitize_seat(player.get("seat"), max_seats=max_seats)
         if seat_i == 0:
             continue
-        seat_to_stack_bb[seat_i] = _to_bb_units(
+        stack_bb, _ = _to_bb_units(
             player.get("starting_stack", 0.0),
             source_bb,
             upper=_MAX_NORMALIZED_STACK_BB,
         )
+        seat_to_stack_bb[seat_i] = stack_bb
 
     sanitized_players: List[Dict[str, Any]] = [
         {
@@ -133,31 +139,33 @@ def sanitize_hand_for_miner(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
     for action in actions_raw:
         if not isinstance(action, dict):
             continue
-        amount_bb = _to_bb_units(
+        amount_bb, amount_clipped = _to_bb_units(
             action.get("amount", 0.0),
             source_bb,
             upper=_MAX_NORMALIZED_ACTION_BB,
         )
-        raise_to_bb = _to_bb_units(
+        raise_to_bb, raise_clipped = _to_bb_units(
             action.get("raise_to"),
             source_bb,
             upper=_MAX_NORMALIZED_POT_BB,
         )
-        call_to_bb = _to_bb_units(
+        call_to_bb, call_clipped = _to_bb_units(
             action.get("call_to"),
             source_bb,
             upper=_MAX_NORMALIZED_POT_BB,
         )
-        pot_before_bb = _to_bb_units(
+        pot_before_bb, pot_before_clipped = _to_bb_units(
             action.get("pot_before", 0.0),
             source_bb,
             upper=_MAX_NORMALIZED_POT_BB,
         )
-        pot_after_bb = _to_bb_units(
+        pot_after_bb, pot_after_clipped = _to_bb_units(
             action.get("pot_after", 0.0),
             source_bb,
             upper=_MAX_NORMALIZED_POT_BB,
         )
+        # Flag if any significant amount was clipped (indicates unusual sizing/deep stacks)
+        any_amount_clipped = amount_clipped or raise_clipped or call_clipped
         raw_actions.append(
             {
                 "action_id": "",
@@ -170,20 +178,40 @@ def sanitize_hand_for_miner(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
                 "normalized_amount_bb": amount_bb,
                 "pot_before": _from_bb_units(pot_before_bb),
                 "pot_after": _from_bb_units(pot_after_bb),
+                "was_clipped": any_amount_clipped,  # Flag for models to detect unusual sizing
             }
         )
 
     sanitized_actions: List[Dict[str, Any]] = []
     if raw_actions:
-        last_idx = len(raw_actions) - 1
-        if len(raw_actions) == 1:
-            indices = [0] * _MINER_ACTION_WINDOW
+        # Preserve temporal information by either subsampling or padding, not duplicating.
+        # If we have ≤12 actions, keep all of them without duplication.
+        # If we have >12 actions, uniformly subsample to exactly 12.
+        if len(raw_actions) <= _MINER_ACTION_WINDOW:
+            sanitized_actions = [dict(action) for action in raw_actions]
+            # Pad with placeholder "no_action" checks to reach exactly 12 windows
+            placeholder_action = {
+                "action_id": "",
+                "street": "no_street",
+                "actor_seat": 0,
+                "action_type": "check",
+                "amount": 0.0,
+                "raise_to": None,
+                "call_to": None,
+                "normalized_amount_bb": 0.0,
+                "pot_before": sanitized_actions[-1]["pot_after"] if sanitized_actions else 0.0,
+                "pot_after": sanitized_actions[-1]["pot_after"] if sanitized_actions else 0.0,
+            }
+            while len(sanitized_actions) < _MINER_ACTION_WINDOW:
+                sanitized_actions.append(dict(placeholder_action))
         else:
+            # Uniformly subsample to exactly 12 actions
+            last_idx = len(raw_actions) - 1
             indices = [
                 int(round(i * last_idx / (_MINER_ACTION_WINDOW - 1)))
                 for i in range(_MINER_ACTION_WINDOW)
             ]
-        sanitized_actions = [dict(raw_actions[i]) for i in indices]
+            sanitized_actions = [dict(raw_actions[i]) for i in indices]
 
     for idx, action in enumerate(sanitized_actions, start=1):
         action["action_id"] = str(idx)

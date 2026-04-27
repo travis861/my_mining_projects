@@ -44,14 +44,35 @@ class Poker44Model:
 
     def _aligned_rows(self, chunks: list[list[dict[str, Any]]]) -> list[list[float]]:
         rows: list[list[float]] = []
+        
         for chunk in chunks:
             feats = chunk_features(chunk)
-            if self.feature_names:
-                rows.append([float(feats.get(name, 0.0)) for name in self.feature_names])
-            else:
+            
+            # If no feature names loaded from artifact, infer from first chunk
+            if not self.feature_names:
                 ordered = sorted(feats)
                 self.feature_names = ordered
-                rows.append([float(feats[name]) for name in ordered])
+                if not self.feature_names:
+                    raise RuntimeError(
+                        f"Failed to extract any features from chunk. "
+                        f"Got empty feature dict: {feats}"
+                    )
+            
+            # Validate that all expected features are present in this chunk
+            # Missing features indicate data corruption or model-data mismatch
+            missing_features = set(self.feature_names) - set(feats.keys())
+            if missing_features:
+                raise RuntimeError(
+                    f"Feature mismatch in chunk inference: "
+                    f"expected {len(self.feature_names)} features ({self.feature_names}), "
+                    f"but missing {len(missing_features)}: {sorted(missing_features)}. "
+                    f"This indicates data formatting or model-training mismatch. "
+                    f"Got features: {sorted(feats.keys())}"
+                )
+            
+            # Align features to training feature order
+            rows.append([float(feats.get(name, 0.0)) for name in self.feature_names])
+        
         return rows
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
