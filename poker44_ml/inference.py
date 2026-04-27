@@ -41,6 +41,10 @@ class Poker44Model:
             self.model = artifact
             self.feature_names = []
             self.metadata = {}
+        self.probability_bias = float(self.metadata.get("probability_bias", 0.0))
+        self.probability_temperature = max(
+            0.25, float(self.metadata.get("probability_temperature", 1.0))
+        )
 
     def _aligned_rows(self, chunks: list[list[dict[str, Any]]]) -> list[list[float]]:
         rows: list[list[float]] = []
@@ -82,12 +86,20 @@ class Poker44Model:
         rows = self._aligned_rows(chunks)
         if hasattr(self.model, "predict_proba"):
             probs = self.model.predict_proba(rows)
-            return [float(row[1]) for row in probs]
+            scores = [float(row[1]) for row in probs]
+            return [self._postprocess_probability(score) for score in scores]
         if hasattr(self.model, "decision_function"):
             raw = self.model.decision_function(rows)
-            return [1.0 / (1.0 + math.exp(-float(value))) for value in raw]
+            scores = [1.0 / (1.0 + math.exp(-float(value))) for value in raw]
+            return [self._postprocess_probability(score) for score in scores]
         preds = self.model.predict(rows)
-        return [float(value) for value in preds]
+        return [self._postprocess_probability(float(value)) for value in preds]
+
+    def _postprocess_probability(self, prob: float) -> float:
+        clipped = min(max(float(prob), 1e-6), 1.0 - 1e-6)
+        logit = math.log(clipped / (1.0 - clipped))
+        shifted = (logit / self.probability_temperature) + self.probability_bias
+        return 1.0 / (1.0 + math.exp(-shifted))
 
     def predict_chunk_score(self, chunk: list[dict[str, Any]]) -> float:
         scores = self.predict_chunk_scores([chunk])

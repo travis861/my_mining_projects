@@ -23,6 +23,15 @@ class Miner(BaseMinerNeuron):
             0, int(os.getenv("POKER44_MAX_HANDS_PER_CHUNK_EVAL", "120"))
         )
         self.query_log_preview = os.getenv("POKER44_LOG_QUERY_PREVIEW", "0") == "1"
+        self.validator_log_summary_every = max(
+            1, int(os.getenv("POKER44_VALIDATOR_LOG_SUMMARY_EVERY", "5"))
+        )
+        self.validator_request_counts: dict[str, int] = {}
+        self.validator_success_counts: dict[str, int] = {}
+        self.validator_blacklist_counts: dict[str, int] = {}
+        self.validator_last_latency_ms: dict[str, float] = {}
+        self.validator_last_seen_at: dict[str, float] = {}
+        self.total_queries_seen = 0
 
         repo_root = Path(__file__).resolve().parents[1]
         model_path = Path(
@@ -32,10 +41,16 @@ class Miner(BaseMinerNeuron):
             )
         )
         self.predictor = Poker44Model(str(model_path))
+        implementation_files = [
+            Path(__file__).resolve(),
+            repo_root / "poker44_ml" / "inference.py",
+            repo_root / "poker44_ml" / "features.py",
+            repo_root / "training" / "train_model.py",
+        ]
 
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
-            implementation_files=[Path(__file__).resolve()],
+            implementation_files=implementation_files,
             defaults={
                 "model_name": "poker44-xgb-calibrated",
                 "model_version": "1",
@@ -99,6 +114,56 @@ class Miner(BaseMinerNeuron):
             f"Fast inference settings | max_hands_per_chunk_eval={self.max_hands_per_chunk_eval} "
             f"query_log_preview={self.query_log_preview}"
         )
+        bt.logging.info(
+            f"Validator logging settings | summary_every={self.validator_log_summary_every}"
+        )
+
+    def _mark_validator_seen(self, caller: str) -> None:
+        self.validator_last_seen_at[caller] = time.time()
+
+    def _record_validator_request(self, caller: str) -> None:
+        self.total_queries_seen += 1
+        self.validator_request_counts[caller] = self.validator_request_counts.get(caller, 0) + 1
+        self._mark_validator_seen(caller)
+
+    def _record_validator_success(self, caller: str, elapsed_ms: float) -> None:
+        self.validator_success_counts[caller] = self.validator_success_counts.get(caller, 0) + 1
+        self.validator_last_latency_ms[caller] = float(elapsed_ms)
+        self._mark_validator_seen(caller)
+
+    def _record_validator_blacklist(self, caller: str) -> None:
+        self.validator_blacklist_counts[caller] = self.validator_blacklist_counts.get(caller, 0) + 1
+        self._mark_validator_seen(caller)
+
+    def _log_validator_summary_if_due(self) -> None:
+        if self.total_queries_seen <= 0:
+            return
+        if self.total_queries_seen % self.validator_log_summary_every != 0:
+            return
+
+        callers = sorted(
+            self.validator_request_counts,
+            key=lambda hotkey: (
+                -self.validator_request_counts.get(hotkey, 0),
+                hotkey,
+            ),
+        )
+        top_callers = callers[:5]
+        summary_parts = []
+        for caller in top_callers:
+            summary_parts.append(
+                f"{caller[:10]}.. "
+                f"req={self.validator_request_counts.get(caller, 0)} "
+                f"ok={self.validator_success_counts.get(caller, 0)} "
+                f"blk={self.validator_blacklist_counts.get(caller, 0)} "
+                f"last_ms={self.validator_last_latency_ms.get(caller, 0.0):.2f}"
+            )
+        bt.logging.info(
+            "Validator summary | "
+            f"total_queries={self.total_queries_seen} "
+            f"unique_callers={len(self.validator_request_counts)} "
+            f"top_callers={summary_parts}"
+        )
 
     @staticmethod
     def _clamp_score(value: float) -> float:
@@ -129,6 +194,7 @@ class Miner(BaseMinerNeuron):
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         chunks = list(synapse.chunks or [])
         caller = getattr(getattr(synapse, "dendrite", None), "hotkey", "unknown")
+        self._record_validator_request(caller)
         chunk_sizes = [len(chunk or []) for chunk in chunks]
         eval_chunks = [self._compress_chunk(list(chunk or [])) for chunk in chunks]
         eval_chunk_sizes = [len(chunk) for chunk in eval_chunks]
@@ -179,19 +245,23 @@ class Miner(BaseMinerNeuron):
                 f"prediction_preview={synapse.predictions[:5]}"
             )
         bt.logging.info(message)
+        self._record_validator_success(caller, elapsed_ms)
         bt.logging.success(
             f"Validator response sent successfully | caller={caller} "
             f"chunk_count={len(chunks)} "
             f"response_count={len(scores)} "
             f"elapsed_ms={elapsed_ms:.2f}"
         )
+        self._log_validator_summary_if_due()
         return synapse
 
     async def blacklist(self, synapse: DetectionSynapse) -> Tuple[bool, str]:
         blocked, reason = self.common_blacklist(synapse)
         caller = getattr(getattr(synapse, "dendrite", None), "hotkey", "unknown")
         if blocked:
+            self._record_validator_blacklist(caller)
             bt.logging.warning(f"Blacklisted request | caller={caller} reason={reason}")
+            self._log_validator_summary_if_due()
         return blocked, reason
 
     async def priority(self, synapse: DetectionSynapse) -> float:

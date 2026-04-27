@@ -3,6 +3,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
+
+from poker44.score.scoring import reward as validator_reward
+
 try:
     from sklearn.metrics import (
         average_precision_score,
@@ -97,11 +101,19 @@ def evaluate_predictions(
         y_prob=clipped_prob,
         target_recall=recall_target,
     )
+    validator_reward_value, reward_details = validator_reward(
+        np.asarray(clipped_prob, dtype=float),
+        np.asarray(labels, dtype=bool),
+    )
     metrics = {
         "roc_auc": float(roc_auc_score(labels, clipped_prob)),
         "pr_auc": float(average_precision_score(labels, clipped_prob)),
         "log_loss": float(log_loss(labels, clipped_prob)),
         "brier_score": float(brier_score_loss(labels, clipped_prob)),
+        "validator_reward": float(validator_reward_value),
+        "validator_ap_score": float(reward_details["ap_score"]),
+        "validator_bot_recall": float(reward_details["bot_recall"]),
+        "validator_human_safety_penalty": float(reward_details["human_safety_penalty"]),
         "fpr_at_recall": float(recall_stats["fpr"]),
         "recall_target": float(recall_target),
         "threshold_at_recall": float(recall_stats["threshold"]),
@@ -117,6 +129,10 @@ def format_metrics(metrics: dict[str, Any]) -> str:
     ordered_keys = (
         "roc_auc",
         "pr_auc",
+        "validator_reward",
+        "validator_ap_score",
+        "validator_bot_recall",
+        "validator_human_safety_penalty",
         "log_loss",
         "brier_score",
         "fpr_at_recall",

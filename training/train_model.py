@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from poker44_ml.inference import Poker44Model
@@ -59,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--colsample-bytree", type=float, default=0.9)
     parser.add_argument("--calibration", choices=("auto", "isotonic", "sigmoid", "none"), default="auto")
     parser.add_argument(
+        "--benchmark-oversample",
+        type=int,
+        default=3,
+        help="How many times to repeat public benchmark train rows in the training mix.",
+    )
+    parser.add_argument(
         "--selection-objective",
         choices=("balanced", "low_fpr"),
         default="low_fpr",
@@ -93,21 +100,79 @@ def choose_calibration(method: str, train_size: int) -> str | None:
 def model_selection_score(metrics: dict[str, float], objective: str) -> float:
     if objective == "balanced":
         return (
-            0.45 * metrics["roc_auc"]
-            + 0.30 * metrics["pr_auc"]
-            - 0.20 * metrics["log_loss"]
-            - 0.15 * metrics["brier_score"]
-            - 0.30 * metrics["fpr_at_threshold_0_5"]
-            - 0.35 * metrics["fpr_at_recall"]
+            0.55 * metrics["validator_reward"]
+            + 0.15 * metrics["roc_auc"]
+            + 0.10 * metrics["pr_auc"]
+            + 0.10 * metrics["validator_bot_recall"]
+            - 0.10 * metrics["log_loss"]
+            - 0.08 * metrics["brier_score"]
+            - 0.15 * metrics["fpr_at_threshold_0_5"]
+            - 0.10 * metrics["fpr_at_recall"]
         )
     return (
-        0.35 * metrics["roc_auc"]
-        + 0.20 * metrics["pr_auc"]
-        - 0.15 * metrics["log_loss"]
-        - 0.10 * metrics["brier_score"]
-        - 0.60 * metrics["fpr_at_threshold_0_5"]
-        - 0.80 * metrics["fpr_at_recall"]
+        0.45 * metrics["validator_reward"]
+        + 0.10 * metrics["roc_auc"]
+        + 0.10 * metrics["pr_auc"]
+        - 0.10 * metrics["log_loss"]
+        - 0.08 * metrics["brier_score"]
+        - 0.85 * metrics["fpr_at_threshold_0_5"]
+        - 0.95 * metrics["fpr_at_recall"]
     )
+
+
+def apply_probability_postprocess(
+    probs: list[float],
+    *,
+    bias: float,
+    temperature: float,
+) -> list[float]:
+    adjusted: list[float] = []
+    safe_temperature = max(0.25, float(temperature))
+    for prob in probs:
+        clipped = min(max(float(prob), 1e-6), 1.0 - 1e-6)
+        logit = math.log(clipped / (1.0 - clipped))
+        transformed = 1.0 / (1.0 + math.exp(-((logit / safe_temperature) + float(bias))))
+        adjusted.append(float(transformed))
+    return adjusted
+
+
+def choose_best_probability_postprocess(
+    *,
+    y_true: list[int],
+    y_prob: list[float],
+    objective: str,
+) -> tuple[list[float], dict[str, float], dict[str, float]]:
+    candidate_settings = [
+        {"bias": -1.00, "temperature": 1.00},
+        {"bias": -0.75, "temperature": 1.00},
+        {"bias": -0.50, "temperature": 1.00},
+        {"bias": -0.35, "temperature": 1.00},
+        {"bias": -0.25, "temperature": 1.10},
+        {"bias": -0.15, "temperature": 1.05},
+        {"bias": 0.00, "temperature": 1.00},
+        {"bias": 0.10, "temperature": 0.95},
+    ]
+
+    best_probs = list(y_prob)
+    best_metrics = evaluate_predictions(y_true=y_true, y_prob=y_prob)
+    best_config = {"bias": 0.0, "temperature": 1.0}
+    best_score = model_selection_score(best_metrics, objective)
+
+    for setting in candidate_settings:
+        transformed = apply_probability_postprocess(
+            y_prob,
+            bias=setting["bias"],
+            temperature=setting["temperature"],
+        )
+        metrics = evaluate_predictions(y_true=y_true, y_prob=transformed)
+        score = model_selection_score(metrics, objective)
+        if score > best_score:
+            best_score = score
+            best_probs = transformed
+            best_metrics = metrics
+            best_config = dict(setting)
+
+    return best_probs, best_metrics, best_config
 
 
 def build_search_configs(args: argparse.Namespace) -> list[dict[str, float | int | str]]:
@@ -201,7 +266,9 @@ def _fit_single_candidate(
         repeats=int(candidate_config["repeats"]),
         seed=args.seed,
     )
-    rows = list(raw_rows) + list(benchmark_train_rows)
+    benchmark_multiplier = max(1, int(args.benchmark_oversample))
+    oversampled_benchmark_rows = benchmark_train_rows * benchmark_multiplier
+    rows = list(raw_rows) + list(oversampled_benchmark_rows)
     if not rows:
         raise RuntimeError("Training dataframe is empty. Verify your human/bot hand sources.")
 
@@ -278,6 +345,7 @@ def _fit_single_candidate(
     best_model = None
     best_metrics = None
     best_calibration = None
+    best_postprocess = {"bias": 0.0, "temperature": 1.0}
     best_selection_score = float("-inf")
 
     for calibration_method in candidate_calibrations:
@@ -286,10 +354,14 @@ def _fit_single_candidate(
             candidate_model = CalibratedClassifierCV(base_model, method=calibration_method, cv=3)
         candidate_model.fit(X_train, y_train)
         if hasattr(candidate_model, "predict_proba"):
-            candidate_probs = candidate_model.predict_proba(X_test)[:, 1]
+            candidate_probs = candidate_model.predict_proba(X_test)[:, 1].tolist()
         else:
-            candidate_probs = candidate_model.predict(X_test)
-        candidate_metrics = evaluate_predictions(y_true=y_test, y_prob=candidate_probs)
+            candidate_probs = [float(value) for value in candidate_model.predict(X_test)]
+        adjusted_probs, candidate_metrics, postprocess_config = choose_best_probability_postprocess(
+            y_true=y_test,
+            y_prob=candidate_probs,
+            objective=args.selection_objective,
+        )
         candidate_score = model_selection_score(candidate_metrics, args.selection_objective)
         print(
             "candidate",
@@ -300,6 +372,8 @@ def _fit_single_candidate(
             f"max_depth={candidate_config['max_depth']}",
             f"learning_rate={candidate_config['learning_rate']}",
             f"calibration={calibration_method or 'none'}",
+            f"prob_bias={postprocess_config['bias']:.2f}",
+            f"prob_temp={postprocess_config['temperature']:.2f}",
             f"selection_score={candidate_score:.6f}",
             format_metrics(candidate_metrics),
         )
@@ -308,9 +382,12 @@ def _fit_single_candidate(
             best_model = candidate_model
             best_metrics = candidate_metrics
             best_calibration = calibration_method
+            best_postprocess = dict(postprocess_config)
 
     result_config = dict(candidate_config)
     result_config["calibration"] = best_calibration or "none"
+    result_config["probability_bias"] = float(best_postprocess["bias"])
+    result_config["probability_temperature"] = float(best_postprocess["temperature"])
     result_config["raw_rows"] = float(len(raw_rows))
     result_config["train_rows"] = float(len(X_train))
     result_config["test_rows"] = float(len(X_test))
@@ -407,9 +484,12 @@ def train_model(args: argparse.Namespace) -> tuple[object, list[str], dict[str, 
         "benchmark_path": str(benchmark_path) if benchmark_path is not None else "",
         "benchmark_train_rows": float(len(benchmark_train_rows)),
         "benchmark_validation_rows": float(len(benchmark_validation_rows)),
+        "benchmark_oversample": float(args.benchmark_oversample),
         "raw_rows": float(final_config.get("raw_rows", 0.0)),
         "train_rows": float(final_config.get("train_rows", 0.0)),
         "test_rows": float(final_config.get("test_rows", 0.0)),
+        "probability_bias": float(final_config.get("probability_bias", 0.0)),
+        "probability_temperature": float(final_config.get("probability_temperature", 1.0)),
         "search_enabled": 1.0 if args.search else 0.0,
         "search_candidates": float(len(search_configs)),
     }

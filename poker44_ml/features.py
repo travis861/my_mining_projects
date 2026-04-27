@@ -47,6 +47,25 @@ def summarize(values: list[float], prefix: str) -> dict[str, float]:
     }
 
 
+def quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if q <= 0.0:
+        return float(min(values))
+    if q >= 1.0:
+        return float(max(values))
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = (len(ordered) - 1) * q
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[lower])
+    weight = position - lower
+    return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
+
+
 def _action_counts(actions: list[dict[str, Any]]) -> Counter[str]:
     return Counter((action.get("action_type") or "").lower() for action in actions)
 
@@ -314,6 +333,14 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     fold_vals = [row["fold_to_action_tendency"] for row in per_hand]
     stack_vals = [row["avg_starting_stack_bb"] for row in per_hand]
     pot_vals = [row["final_pot_bb"] for row in per_hand]
+    action_count_vals = [row["n_actions"] for row in per_hand]
+    street_count_vals = [row["n_streets"] for row in per_hand]
+    player_count_vals = [row["n_players"] for row in per_hand]
+    bet_size_vals = [row["avg_bet_size_bb"] for row in per_hand]
+    action_size_vals = [row["avg_action_size_bb"] for row in per_hand]
+    all_in_like_vals = [row["all_in_like_ratio"] for row in per_hand]
+    short_stack_vals = [row["short_stack_ratio"] for row in per_hand]
+    actor_concentration_vals = [row["actor_concentration"] for row in per_hand]
 
     out["consistency_score"] = safe_div(
         1.0,
@@ -351,6 +378,61 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     )
     out["action_transition_entropy_mean"] = float(
         statistics.fmean(row["action_transition_entropy"] for row in per_hand)
+    )
+    out["vpip_median"] = quantile(vpip_vals, 0.5)
+    out["vpip_p25"] = quantile(vpip_vals, 0.25)
+    out["vpip_p75"] = quantile(vpip_vals, 0.75)
+    out["aggression_median"] = quantile(aggr_vals, 0.5)
+    out["aggression_p75"] = quantile(aggr_vals, 0.75)
+    out["raise_freq_median"] = quantile(raise_vals, 0.5)
+    out["fold_tendency_median"] = quantile(fold_vals, 0.5)
+    out["actions_median"] = quantile(action_count_vals, 0.5)
+    out["actions_p90"] = quantile(action_count_vals, 0.9)
+    out["streets_median"] = quantile(street_count_vals, 0.5)
+    out["players_median"] = quantile(player_count_vals, 0.5)
+    out["bet_size_median_bb"] = quantile(bet_size_vals, 0.5)
+    out["bet_size_p90_bb"] = quantile(bet_size_vals, 0.9)
+    out["action_size_median_bb"] = quantile(action_size_vals, 0.5)
+    out["stack_median_bb"] = quantile(stack_vals, 0.5)
+    out["pot_median_bb"] = quantile(pot_vals, 0.5)
+    out["pot_p90_bb"] = quantile(pot_vals, 0.9)
+    out["actor_concentration_p90"] = quantile(actor_concentration_vals, 0.9)
+    out["all_in_like_ratio_mean"] = float(statistics.fmean(all_in_like_vals))
+    out["short_stack_ratio_mean"] = float(statistics.fmean(short_stack_vals))
+    out["loose_hand_rate"] = float(statistics.fmean(1.0 if value >= 0.55 else 0.0 for value in vpip_vals))
+    out["tight_hand_rate"] = float(statistics.fmean(1.0 if value <= 0.20 else 0.0 for value in vpip_vals))
+    out["aggressive_hand_rate"] = float(statistics.fmean(1.0 if value >= 0.55 else 0.0 for value in aggr_vals))
+    out["passive_hand_rate"] = float(statistics.fmean(1.0 if value <= 0.20 else 0.0 for value in aggr_vals))
+    out["raise_heavy_hand_rate"] = float(statistics.fmean(1.0 if value >= 0.25 else 0.0 for value in raise_vals))
+    out["fold_heavy_hand_rate"] = float(statistics.fmean(1.0 if value >= 0.45 else 0.0 for value in fold_vals))
+    out["deep_showdown_rate"] = float(
+        statistics.fmean(1.0 if row["showdown"] and row["n_streets"] >= 3.0 else 0.0 for row in per_hand)
+    )
+    out["heads_up_rate"] = float(statistics.fmean(row["heads_up_flag"] for row in per_hand))
+    out["full_ring_rate"] = float(statistics.fmean(row["full_ring_flag"] for row in per_hand))
+    out["deep_stack_rate"] = float(statistics.fmean(row["deep_stack_flag"] for row in per_hand))
+    out["hero_known_rate"] = float(statistics.fmean(row["hero_position_known"] for row in per_hand))
+    out["hero_button_rate"] = float(statistics.fmean(row["hero_on_button"] for row in per_hand))
+    out["hero_blind_rate"] = float(statistics.fmean(row["hero_in_blinds"] for row in per_hand))
+    out["hero_late_rate"] = float(statistics.fmean(row["hero_late_position"] for row in per_hand))
+    out["preflop_postflop_gap_mean"] = float(
+        statistics.fmean(
+            row["preflop_action_ratio"] - (row["flop_action_ratio"] + row["turn_action_ratio"] + row["river_action_ratio"])
+            for row in per_hand
+        )
+    )
+    out["river_commitment_rate"] = float(
+        statistics.fmean(1.0 if row["river_action_ratio"] >= 0.20 else 0.0 for row in per_hand)
+    )
+    out["large_pot_rate"] = float(statistics.fmean(1.0 if pot >= 30.0 else 0.0 for pot in pot_vals))
+    out["short_stack_pressure_rate"] = float(statistics.fmean(1.0 if value >= 0.30 else 0.0 for value in short_stack_vals))
+    out["bet_size_instability"] = safe_div(
+        quantile(bet_size_vals, 0.9) - quantile(bet_size_vals, 0.1),
+        quantile(bet_size_vals, 0.5) if quantile(bet_size_vals, 0.5) > 0 else 1.0,
+    )
+    out["pot_size_instability"] = safe_div(
+        quantile(pot_vals, 0.9) - quantile(pot_vals, 0.1),
+        quantile(pot_vals, 0.5) if quantile(pot_vals, 0.5) > 0 else 1.0,
     )
     out["log_chunk_size"] = math.log1p(len(chunk))
     return out
