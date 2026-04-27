@@ -317,12 +317,15 @@ def hand_features(hand: dict[str, Any]) -> dict[str, float]:
 
 def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     if not chunk:
-        return {"chunk_size": 0.0}
+        return {"chunk_size": 0.0, "hand_count": 0.0}
 
     per_hand = [hand_features(hand) for hand in chunk]
     feature_names = sorted(per_hand[0].keys())
 
-    out = {"chunk_size": float(len(chunk))}
+    out = {
+        "chunk_size": float(len(chunk)),
+        "hand_count": float(len(chunk)),
+    }
     for name in feature_names:
         values = [row[name] for row in per_hand]
         out.update(summarize(values, name))

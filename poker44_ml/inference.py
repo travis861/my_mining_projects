@@ -51,6 +51,10 @@ class Poker44Model:
         
         for chunk in chunks:
             feats = chunk_features(chunk)
+            if "hand_count" not in feats and "chunk_size" in feats:
+                feats["hand_count"] = float(feats["chunk_size"])
+            elif "chunk_size" not in feats and "hand_count" in feats:
+                feats["chunk_size"] = float(feats["hand_count"])
             
             # If no feature names loaded from artifact, infer from first chunk
             if not self.feature_names:
@@ -65,6 +69,12 @@ class Poker44Model:
             # Validate that all expected features are present in this chunk
             # Missing features indicate data corruption or model-data mismatch
             missing_features = set(self.feature_names) - set(feats.keys())
+            if missing_features == {"hand_count"} and "chunk_size" in feats:
+                feats["hand_count"] = float(feats["chunk_size"])
+                missing_features = set(self.feature_names) - set(feats.keys())
+            elif missing_features == {"chunk_size"} and "hand_count" in feats:
+                feats["chunk_size"] = float(feats["hand_count"])
+                missing_features = set(self.feature_names) - set(feats.keys())
             if missing_features:
                 raise RuntimeError(
                     f"Feature mismatch in chunk inference: "
